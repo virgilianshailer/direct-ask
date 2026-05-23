@@ -24,6 +24,14 @@ var PROMPT_CHARACTER_INTERVIEW =
     "Do NOT advance the main roleplay scene. Answer the user's questions directly, speaking to the user. " +
     "Respond in the same language the user uses.]";
 
+var PROMPT_VISUALIZE_SCENE =
+    "[OOC: Your task is to create a detailed image generation prompt based on the following text. " +
+    "The prompt must vividly describe the visual scene: characters, their appearance, clothing, pose, " +
+    "setting, environment, lighting, atmosphere, mood, and art style. " +
+    "Style guidance: {{FORMAT_HINT}}\n\n" +
+    "Text to visualize:\n{{TEXT}}\n\n" +
+    "Respond ONLY with JSON: {\"image_prompt\": \"the full image generation prompt\"}\nONLY JSON!]";
+
 var DEFAULT_SHORTCUTS = [
     { label: "\u{1F552} Time",       prompt: "What time of day is it right now in the current scene? Be specific." },
     { label: "\u{1F4CD} Location",   prompt: "Where is the current scene taking place? Describe the location." },
@@ -42,7 +50,9 @@ var DEFAULTS = {
     useContext: true, conversationMode: true, maxContextMessages: 10,
     shortcuts: null,
     floatingMode: false, modalWidth: 660, modalHeight: 520,
-    modalPosX: -1, modalPosY: -1
+    modalPosX: -1, modalPosY: -1,
+    visualizePresetId: "",
+    enforcePromptLimit: true, maxPromptTokens: 8192
 };
 
 var settings      = null;
@@ -62,6 +72,33 @@ function L() { console.log.apply(console, ["[DirectAsk]"].concat(Array.from(argu
 function W() { console.warn.apply(console, ["[DirectAsk]"].concat(Array.from(arguments))); }
 function E() { console.error.apply(console, ["[DirectAsk]"].concat(Array.from(arguments))); }
 function cloneShortcuts(a) { return JSON.parse(JSON.stringify(a)); }
+
+/* ================ TOKEN BUDGET ================ */
+
+/**
+ * Estimate the number of tokens in a string.
+ * Tries to use SillyTavern's built-in tokenizer (getTokenCount on the global
+ * context or window). If unavailable, falls back to a rough char/4 estimate,
+ * which is conservative for English-like text and a reasonable approximation
+ * for most LLM tokenizers.
+ */
+function estimateTokens(text) {
+    if (!text) return 0;
+    try {
+        if (getContextFn) {
+            var ctx = getContextFn();
+            if (ctx && typeof ctx.getTokenCount === "function") {
+                var n = ctx.getTokenCount(text);
+                if (typeof n === "number" && isFinite(n) && n >= 0) return n;
+            }
+        }
+        if (typeof window !== "undefined" && typeof window.getTokenCount === "function") {
+            var n2 = window.getTokenCount(text);
+            if (typeof n2 === "number" && isFinite(n2) && n2 >= 0) return n2;
+        }
+    } catch (e) { /* fall through to estimate */ }
+    return Math.ceil(text.length / 4);
+}
 
 L("File loaded");
 
@@ -295,14 +332,63 @@ async function askLLM(question) {
     }
 
     if (useCtx && scriptModule && scriptModule.chat && scriptModule.chat.length > 0) {
-        prompt += "--- RECENT STORY EVENTS & CONTEXT ---\n";
         var stChat = scriptModule.chat;
-        var startIdx = Math.max(0, stChat.length - 15); 
-        for (var j = startIdx; j < stChat.length; j++) {
-            var msgName = stChat[j].name || "System";
-            prompt += msgName + ": " + stChat[j].mes + "\n\n";
+        var rpHeader = "--- RECENT STORY EVENTS & CONTEXT ---\n";
+        var rpFooter = "--------------------------------------\n\n";
+
+        // Build a budget for the RP history segment so the final prompt
+        // stays within the user's configured token limit. The budget is
+        // computed against the prompt as-it-stands plus a small reserve for
+        // the conversation block and the trailing "User: ... Assistant:".
+        var limitOn = !!(settings && settings.enforcePromptLimit);
+        var maxTokens = (settings && settings.maxPromptTokens) || 0;
+        var maxMessages = 15; // legacy hard cap, also the cap when limit is off
+        var historyBudget = Infinity;
+
+        if (limitOn && maxTokens > 0) {
+            var reserveText = "User: " + question + "\n" + (isCharacter ? target : "Assistant") + ":";
+            if (settings.conversationMode && convo.length > 0) {
+                var slicePreview = convo.slice(-settings.maxContextMessages);
+                for (var ci = 0; ci < slicePreview.length; ci++) {
+                    reserveText += slicePreview[ci].role + ": " + slicePreview[ci].content + "\n\n";
+                }
+            }
+            var used = estimateTokens(prompt) + estimateTokens(rpHeader) + estimateTokens(rpFooter) + estimateTokens(reserveText);
+            historyBudget = Math.max(0, maxTokens - used);
+            // Allow a much larger window of candidate messages when the
+            // budget controls the cut-off — limit only by the budget itself.
+            maxMessages = stChat.length;
         }
-        prompt += "--------------------------------------\n\n";
+
+        // Walk the chat newest-first; keep adding messages while they fit
+        // the budget. Drop the oldest first, preserve the most recent.
+        var lines = [];
+        var usedHistoryTokens = 0;
+        var lookback = Math.min(stChat.length, maxMessages);
+        for (var k = stChat.length - 1; k >= stChat.length - lookback; k--) {
+            var msgName2 = stChat[k].name || "System";
+            var line = msgName2 + ": " + stChat[k].mes + "\n\n";
+            var lineTokens = estimateTokens(line);
+            if (limitOn && (usedHistoryTokens + lineTokens > historyBudget)) {
+                // No more room. Stop walking back further — older messages
+                // would only make it worse.
+                break;
+            }
+            lines.push(line);
+            usedHistoryTokens += lineTokens;
+        }
+
+        if (lines.length > 0) {
+            prompt += rpHeader;
+            // lines were collected newest-first; flip to chronological order
+            for (var m = lines.length - 1; m >= 0; m--) prompt += lines[m];
+            prompt += rpFooter;
+            if (limitOn && lines.length < stChat.length) {
+                L("RP history truncated: kept " + lines.length + " / " + stChat.length + " messages (~" + usedHistoryTokens + " tokens, budget " + historyBudget + ")");
+            }
+        } else if (limitOn) {
+            L("RP history skipped entirely: prompt is already at/over the token limit (" + maxTokens + ").");
+        }
     }
 
     if (settings.conversationMode && convo.length > 0) {
@@ -315,6 +401,23 @@ async function askLLM(question) {
     }
 
     prompt += "User: " + question + "\n" + (isCharacter ? target : "Assistant") + ":";
+
+    // Final safety net: log a warning if the prompt is still over the user's
+    // budget after history truncation (e.g. huge character card + huge sys
+    // prompt + huge conversation history). We don't silently mutilate those
+    // segments — but the user gets a clear log entry to act on.
+    if (settings && settings.enforcePromptLimit && settings.maxPromptTokens > 0) {
+        var finalTokens = estimateTokens(prompt);
+        if (finalTokens > settings.maxPromptTokens) {
+            W("Prompt is still over the configured limit after truncation: ~" +
+              finalTokens + " > " + settings.maxPromptTokens +
+              " tokens. Consider lowering character card size, conversation history, or raising the limit.");
+            if (typeof toastr !== "undefined") {
+                toastr.warning("Direct Ask: prompt (~" + finalTokens + " tok) exceeds the configured limit (" + settings.maxPromptTokens + "). The API may reject it.");
+            }
+        }
+    }
+
     var answer;
 
     if (useCtx || isCharacter) {
@@ -481,6 +584,13 @@ function buildModal() {
         scrollDown();
     });
 
+    $(document).on("click", ".da-visualize-btn", function () {
+        var $msg = $(this).closest(".da-message");
+        var raw = $msg.data("raw-text") || $msg.find(".da-msg-content").text();
+        if (!raw || !raw.trim()) return;
+        visualizeResponse($msg.attr("id"), raw);
+    });
+
     $(document).on("click", ".da-inject-btn", function () {
         var $btn = $(this), $msg = $btn.closest(".da-message");
         if ($btn.hasClass("da-injected")) {
@@ -498,6 +608,27 @@ function buildModal() {
             $btn.prop("disabled", false);
             if (typeof toastr !== "undefined") toastr.error("Inject failed: " + e.message);
         });
+    });
+
+    $(document).on("click", ".da-viz-img", function () {
+        var src = $(this).attr("src");
+        if (!src) return;
+        $("#da-lightbox").remove();
+        var lb = '<div id="da-lightbox"><div class="da-lb-overlay"></div><div class="da-lb-content"><img src="' + src + '" class="da-lb-img"><button class="da-lb-close" title="Close"><i class="fa-solid fa-xmark"></i></button></div></div>';
+        document.body.insertAdjacentHTML("beforeend", lb);
+        setTimeout(function () { $("#da-lightbox").addClass("da-lb-visible"); }, 10);
+    });
+    $(document).on("click", ".da-lb-overlay, .da-lb-close", function () {
+        var $lb = $("#da-lightbox");
+        $lb.removeClass("da-lb-visible");
+        setTimeout(function () { $lb.remove(); }, 220);
+    });
+    $(document).on("keydown.da-lb", function (e) {
+        if (e.key === "Escape" && $("#da-lightbox").length) {
+            var $lb = $("#da-lightbox");
+            $lb.removeClass("da-lb-visible");
+            setTimeout(function () { $lb.remove(); }, 220);
+        }
     });
 
     $(document).on("keydown", "#da-input", function (e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSend(); } });
@@ -730,10 +861,11 @@ function addMsg(role, content, customName) {
     if (!isU) {
         btns += '<button class="da-translate-btn" title="Translate"><i class="fa-solid fa-language"></i></button>';
         btns += '<button class="da-inject-btn" title="Inject into RP chat"><i class="fa-solid fa-share-from-square"></i></button>';
+        btns += '<button class="da-visualize-btn" title="Visualize with AutoIllustrator"><i class="fa-solid fa-image"></i></button>';
         btns += '<button class="da-copy-btn" title="Copy"><i class="fa-solid fa-copy"></i></button>';
     }
     
-    var m = '<div id="' + id + '" class="da-message da-' + role + extraCls + '"><div class="da-msg-avatar">' + avatarContent + '</div><div class="da-msg-body"><div class="da-msg-meta"><span class="da-msg-name">' + name + '</span>' + btns + '</div><div class="da-msg-content">' + content + '</div></div></div>';
+    var m = '<div id="' + id + '" class="da-message da-' + role + extraCls + '"><div class="da-msg-avatar">' + avatarContent + '</div><div class="da-msg-body"><div class="da-msg-meta"><span class="da-msg-name">' + name + '</span>' + btns + '</div><div class="da-msg-content">' + content + '</div>' + ((!isU) ? '<div class="da-img-result" style="display:none"></div>' : '') + '</div></div>';
     
     $("#da-conversation").append(m); scrollDown();
     return id;
@@ -911,6 +1043,199 @@ async function captionImage(base64DataUrl) {
     throw new Error("No caption in extras response");
 }
 
+/* ================ AUTO ILLUSTRATOR BRIDGE ================ */
+
+function daGetAISettings() { return (extSettings && extSettings.auto_illustrator) ? extSettings.auto_illustrator : null; }
+function daGetAIPresetsAll() { var ai = daGetAISettings(); if (!ai || !ai.workflowPresets) return []; return ai.workflowPresets; }
+function daGetAIPresetById(id) { if (!id) return null; var p = daGetAIPresetsAll(); for (var i = 0; i < p.length; i++) { if (p[i].id === id) return p[i]; } return null; }
+function daGetAIActivePreset() { var ai = daGetAISettings(); if (!ai || !ai.workflowPresets || !ai.activePresetId) return null; for (var i = 0; i < ai.workflowPresets.length; i++) { if (ai.workflowPresets[i].id === ai.activePresetId) return ai.workflowPresets[i]; } return null; }
+function daGetImagePreset() { if (settings && settings.visualizePresetId) { var p = daGetAIPresetById(settings.visualizePresetId); if (p) return p; } return daGetAIActivePreset(); }
+function daGetComfyUrl() { var ai = daGetAISettings(); if (ai && ai.comfyUrl && ai.comfyUrl.trim()) return ai.comfyUrl.trim().replace(/\/+$/, ""); if (extSettings && extSettings.sd && extSettings.sd.comfy_url) return extSettings.sd.comfy_url.replace(/\/+$/, ""); return "http://127.0.0.1:8188"; }
+function daEscJ(s) { return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t"); }
+
+function daGetFormatHint(preset) {
+    var fmt = preset ? (preset.promptFormat || "flux") : "flux";
+    var key = fmt.replace(/^pov_/, "");
+    var hints = {
+        flux: "Natural language, vivid and detailed. Describe the scene cinematically.",
+        sd15: "Comma-separated tags: detailed, cinematic, dramatic lighting, high quality",
+        illustrious: "Danbooru-style tags: detailed, cinematic_composition, atmospheric",
+        noobai: "Tags: detailed, cinematic, atmospheric, masterpiece",
+        custom: "Descriptive scene illustration prompt."
+    };
+    return hints[key] || hints.flux;
+}
+
+function daFillWorkflow(workflowStr, promptText, negText, width, height, preset) {
+    var t = workflowStr;
+    var sd = (extSettings && extSettings.sd) || {};
+    function v(pv, k1, def) { return pv || sd[k1] || def || ""; }
+    var BLANK = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    var strMap = {
+        "%prompt%": daEscJ(promptText),
+        "%negative_prompt%": daEscJ(negText || ""),
+        "%model%": daEscJ(v(preset && preset.model, "comfy_model", "")),
+        "%vae%": daEscJ(v(preset && preset.vae, "comfy_vae", "")),
+        "%vae_name%": daEscJ(v(preset && preset.vae, "comfy_vae", "")),
+        "%sampler%": daEscJ(v(preset && preset.sampler, "comfy_sampler", "euler")),
+        "%scheduler%": daEscJ(v(preset && preset.scheduler, "comfy_scheduler", "normal")),
+        "%clip_name%": daEscJ(sd.comfy_clip || ""),
+        "%clip_name1%": daEscJ(sd.comfy_clip1 || sd.comfy_clip || ""),
+        "%clip_name2%": daEscJ(sd.comfy_clip2 || ""),
+        "%user_avatar%": BLANK,
+        "%char_avatar%": BLANK
+    };
+    for (var ai = 1; ai <= 8; ai++) strMap["%avatar_" + ai + "%"] = BLANK;
+    var numMap = {
+        "%width%": Math.max(512, Math.round((preset && preset.width || 768) / 64) * 64),
+        "%height%": Math.max(512, Math.round((preset && preset.height || 768) / 64) * 64),
+        "%seed%": Math.floor(Math.random() * 2147483647),
+        "%steps%": (preset && preset.steps) || sd.comfy_steps || 20,
+        "%cfg%": (preset && preset.cfg) || sd.comfy_cfg || 7,
+        "%scale%": (preset && preset.cfg) || sd.comfy_cfg || 7,
+        "%denoise%": (preset && preset.denoise !== undefined) ? preset.denoise : 1,
+        "%clip_skip%": (preset && preset.clipSkip) || 1,
+        "%batch%": 1,
+        "%batch_size%": 1
+    };
+    var key;
+    for (key in strMap) if (strMap.hasOwnProperty(key)) t = t.split(key).join(strMap[key]);
+    for (key in numMap) if (numMap.hasOwnProperty(key)) {
+        var val = String(numMap[key]);
+        t = t.split('"' + key + '"').join(val);
+        t = t.split(key).join(val);
+    }
+    try { return JSON.parse(t); } catch(e) { E("DA workflow parse error:", e.message); return null; }
+}
+
+async function daComfyGenerate(workflowObj) {
+    var base = daGetComfyUrl();
+    var qr = await fetch(base + "/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: workflowObj })
+    });
+    if (!qr.ok) {
+        var ei = ""; try { var ed = await qr.json(); ei = ed.error ? ed.error.message : JSON.stringify(ed).substring(0, 200); } catch(e) {}
+        throw new Error("ComfyUI: " + qr.status + " " + ei);
+    }
+    var pid = (await qr.json()).prompt_id;
+    var deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        var hr;
+        try { hr = await fetch(base + "/history/" + pid); if (!hr.ok) continue; } catch(e) { continue; }
+        var hist = await hr.json();
+        if (!hist[pid]) continue;
+        var entry = hist[pid];
+        if (entry.status && entry.status.status_str === "error") {
+            var errMsg = "ComfyUI error";
+            if (entry.status.messages) entry.status.messages.forEach(function(m) {
+                if (m[0] === "execution_error") errMsg = (m[1].node_type || "") + ": " + (m[1].exception_message || "").substring(0, 200);
+            });
+            throw new Error(errMsg);
+        }
+        var outs = entry.outputs;
+        if (!outs || !Object.keys(outs).length) { if (entry.status && entry.status.completed) return null; continue; }
+        for (var nid in outs) {
+            var imgs = outs[nid] && outs[nid].images;
+            if (!imgs || !imgs.length) continue;
+            var ir = await fetch(base + "/view?" + new URLSearchParams({ filename: imgs[0].filename, subfolder: imgs[0].subfolder || "", type: imgs[0].type || "output" }).toString());
+            if (!ir.ok) continue;
+            return await ir.blob();
+        }
+    }
+    throw new Error("ComfyUI timeout (3 min)");
+}
+
+async function daGenerateVisualPrompt(text) {
+    var fn = genRaw || genQuiet;
+    if (!fn) throw new Error("Generation not available. Connect an API first.");
+    var preset = daGetImagePreset();
+    var hint = daGetFormatHint(preset);
+    var prompt = PROMPT_VISUALIZE_SCENE
+        .replace("{{FORMAT_HINT}}", hint)
+        .replace("{{TEXT}}", text.substring(0, 1500));
+    var raw;
+    try { raw = await fn({ prompt: prompt }); } catch(e) { raw = await fn(prompt); }
+    try {
+        var m = raw.match(/\{[\s\S]*\}/);
+        if (m) { var d = JSON.parse(m[0]); if (d && d.image_prompt) return d.image_prompt.trim(); }
+    } catch(e) {}
+    return raw.trim().substring(0, 600);
+}
+
+async function visualizeResponse(id, rawText) {
+    var preset = daGetImagePreset();
+    if (!preset) {
+        if (typeof toastr !== "undefined") toastr.error("No AutoIllustrator preset found. Select one in Direct Ask settings.");
+        return;
+    }
+    if (!preset.workflow) {
+        if (typeof toastr !== "undefined") toastr.error("Selected preset has no ComfyUI workflow.");
+        return;
+    }
+    var $msg = $("#" + id);
+    var $btn = $msg.find(".da-visualize-btn");
+    var $area = $msg.find(".da-img-result");
+    $btn.prop("disabled", true);
+    $area.html('<div class="da-viz-loading"><i class="fa-solid fa-circle-notch fa-spin"></i> Building image prompt…</div>').show();
+    scrollDown();
+    try {
+        var imgPrompt = await daGenerateVisualPrompt(rawText);
+        $area.html('<div class="da-viz-loading"><i class="fa-solid fa-circle-notch fa-spin"></i> Generating image via ComfyUI…</div>');
+        scrollDown();
+        var neg = preset.negativePrompt || "";
+        var wfObj = daFillWorkflow(preset.workflow, imgPrompt, neg, preset.width || 768, preset.height || 768, preset);
+        if (!wfObj) throw new Error("Failed to parse workflow JSON.");
+        var blob = await daComfyGenerate(wfObj);
+        if (!blob) throw new Error("No image returned by ComfyUI.");
+        var dataUrl = await new Promise(function(resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function() { resolve(reader.result); };
+            reader.onerror = function() { reject(new Error("Failed to read image blob")); };
+            reader.readAsDataURL(blob);
+        });
+        $area.html(
+            '<div class="da-viz-result">' +
+            '<div class="da-viz-prompt-label" title="' + esc(imgPrompt) + '">' +
+            '<i class="fa-solid fa-wand-magic-sparkles"></i> ' +
+            '<em>' + esc(imgPrompt.substring(0, 90)) + (imgPrompt.length > 90 ? "…" : "") + '</em>' +
+            '</div>' +
+            '<img src="' + dataUrl + '" class="da-viz-img" alt="Visualized scene">' +
+            '</div>'
+        );
+        $btn.addClass("da-visualized").prop("disabled", false)
+            .attr("title", "Re-visualize").find("i").removeClass("fa-image").addClass("fa-rotate-right");
+    } catch(e) {
+        $area.html('<span class="da-error"><i class="fa-solid fa-triangle-exclamation"></i> ' + esc(e.message) + '</span>');
+        $btn.prop("disabled", false);
+        E("Visualize error:", e);
+    }
+    scrollDown();
+}
+
+function rebuildDAImgPresetDropdown() {
+    var $sel = $("#da-opt-viz-preset");
+    if (!$sel.length) return;
+    var current = $sel.val();
+    $sel.empty().append('<option value="">— Use active AI preset —</option>');
+    var presets = daGetAIPresetsAll();
+    for (var i = 0; i < presets.length; i++) {
+        var p = presets[i];
+        $sel.append('<option value="' + esc(p.id) + '">' + esc(p.name || p.id) + '</option>');
+    }
+    var saved = (settings && settings.visualizePresetId) || current || "";
+    if (saved) {
+        if ($sel.find('option[value="' + esc(saved) + '"]').length) {
+            $sel.val(saved);
+        } else {
+            $sel.append('<option value="' + esc(saved) + '">Loading saved preset…</option>');
+            $sel.val(saved);
+        }
+    }
+}
+
 /* ================ CHAT BUTTON ================ */
 
 function buildChatButton() {
@@ -946,12 +1271,26 @@ function buildSettingsPanel() {
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="da-opt-ctx"><span>Use RP context by default</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="da-opt-conv"><span>Conversation mode</span></label></div>';
     h += '<div class="da-srow" id="da-ctxn-row"><label><small>Max context messages: <span id="da-ctx-val">10</span></small></label>';
-    h += '<input type="range" id="da-opt-maxctx" min="2" max="30" step="2"></div><hr>';
+    h += '<input type="range" id="da-opt-maxctx" min="2" max="30" step="2"></div>';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="da-opt-tok-on"><span>Limit prompt size <small>(prevents API context-overflow errors)</small></span></label></div>';
+    h += '<div class="da-srow" id="da-tok-row">';
+    h += '<label><small>Max prompt tokens:</small></label>';
+    h += '<input type="number" id="da-opt-maxtok" class="text_pole" min="512" max="1000000" step="256" style="width:140px">';
+    h += '<small class="da-settings-hint">Older RP chat messages will be dropped first to fit. Set this a bit below your model\'s context window to leave room for the reply. Range: 512 – 1,000,000.</small>';
+    h += '</div><hr>';
     h += '<div class="da-srow"><label><small>Prompt WITH RP context:</small></label>';
     h += '<textarea id="da-opt-prompt-ctx" class="text_pole textarea_compact" rows="3"></textarea></div>';
     h += '<div class="da-srow"><label><small>Prompt WITHOUT context:</small></label>';
     h += '<textarea id="da-opt-prompt-noctx" class="text_pole textarea_compact" rows="2"></textarea></div>';
     h += '<div class="da-srow da-srow-btns"><input id="da-opt-reset-prompts" class="menu_button" type="button" value="Reset prompts"></div><hr>';
+    h += '<div class="da-srow"><label><small><b>\uD83C\uDFA8 Visualize (AutoIllustrator):</b></small></label></div>';
+    h += '<div class="da-srow" id="da-viz-preset-row">';
+    h += '<label><small>ComfyUI preset:</small></label>';
+    h += '<div style="display:flex;gap:6px;align-items:center;margin-top:4px">';
+    h += '<select id="da-opt-viz-preset" class="text_pole" style="flex:1;font-size:.85em"><option value="">— Use active AI preset —</option></select>';
+    h += '<input id="da-viz-preset-refresh" class="menu_button" type="button" value="\u21BB" title="Refresh preset list">';
+    h += '</div></div>';
+    h += '<small class="da-settings-hint">Click <i class="fa-solid fa-image"></i> on any AI reply to visualize it. Requires <b>AutoIllustrator</b> extension with ComfyUI connected.</small><hr>';
     h += '<div class="da-srow"><label><small><b>Quick Shortcuts:</b></small></label></div>';
     h += '<div id="da-sc-list" class="da-sc-list"></div>';
     h += '<div class="da-sc-add-form">';
@@ -984,6 +1323,16 @@ function buildSettingsPanel() {
     $("#da-ctxn-row").toggle(settings.conversationMode);
     $("#da-opt-maxctx").val(settings.maxContextMessages).on("input", function () { settings.maxContextMessages = parseInt(this.value, 10); $("#da-ctx-val").text(this.value); save(); });
     $("#da-ctx-val").text(settings.maxContextMessages);
+    $("#da-opt-tok-on").prop("checked", !!settings.enforcePromptLimit).on("change", function () { settings.enforcePromptLimit = this.checked; save(); $("#da-tok-row").toggle(this.checked); });
+    $("#da-tok-row").toggle(!!settings.enforcePromptLimit);
+    $("#da-opt-maxtok").val(settings.maxPromptTokens || 8192).on("change", function () {
+        var v = parseInt(this.value, 10);
+        if (!isFinite(v) || v < 512) v = 512;
+        if (v > 1000000) v = 1000000;
+        settings.maxPromptTokens = v;
+        this.value = v;
+        save();
+    });
     $("#da-opt-prompt-ctx").val(settings.promptWithCtx).on("input", function () { settings.promptWithCtx = this.value; save(); });
     $("#da-opt-prompt-noctx").val(settings.promptNoCtx).on("input", function () { settings.promptNoCtx = this.value; save(); });
     $("#da-opt-reset-prompts").on("click", function () {
@@ -1005,6 +1354,15 @@ function buildSettingsPanel() {
     });
     $("#da-sc-reset-btn").on("click", function () { settings.shortcuts = cloneShortcuts(DEFAULT_SHORTCUTS); save(); renderSettingsShortcuts(); renderShortcuts(); });
     $("#da-opt-open").on("click", function () { showModal(true); });
+
+    // Visualize preset
+    rebuildDAImgPresetDropdown();
+    setTimeout(rebuildDAImgPresetDropdown, 2000);
+    $(document).on("change", "#da-opt-viz-preset", function () { settings.visualizePresetId = this.value; save(); });
+    $(document).on("click", "#da-viz-preset-refresh", function () {
+        rebuildDAImgPresetDropdown();
+        if (typeof toastr !== "undefined") toastr.info("Found " + daGetAIPresetsAll().length + " AutoIllustrator preset(s).");
+    });
 }
 
 function renderSettingsShortcuts() {
