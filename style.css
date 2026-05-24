@@ -873,3 +873,15 @@ body.da-dragging * { cursor: grabbing !important; }
     border-color: #e74c3c;
     transform: scale(1.1);
 }
+/* ============================================================
+   Mobile / narrow screens (<1000px)
+   On a narrow viewport, vertically centering the dialog pushes its
+   top edge offscreen (under SillyTavern's fixed toolbar), making the
+   header unreachable. Top-aligning the dialog fixes this and also puts
+   the otherwise-wasted top space to use. Desktop is unaffected.
+   ============================================================ */
+@media (max-width: 1000px) {
+    #direct-ask-modal {
+        align-items: unset;
+    }
+}
