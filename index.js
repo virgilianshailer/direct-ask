@@ -18,6 +18,15 @@ var PROMPT_NO_CONTEXT =
     "roleplay or story. Ignore all character cards, personas, and chat history. " +
     "Answer based on your general knowledge. Respond in the user's language.";
 
+// Restated right before the answer marker. The system instruction sits far
+// above a long story block, and the last thing a model reads wins — without
+// this the model slides back into the character it has just read pages of.
+var PROMPT_OOC_REMINDER =
+    "[Reminder: answer OUT OF CHARACTER, as the AI assistant talking to the player. " +
+    "Do NOT reply as {{char}} or any other character, do NOT write dialogue, actions, " +
+    "narration or *asterisks*, do NOT continue the scene. Give a plain, direct answer " +
+    "to the question above, in the user's language.]";
+
 var PROMPT_CHARACTER_INTERVIEW =
     "[OOC: This is a direct, out-of-scene interview or conversation with the character \"{{char}}\". " +
     "You MUST respond entirely IN-CHARACTER as \"{{char}}\". Maintain your persona, speech style, formatting, and current knowledge based on the story. " +
@@ -51,6 +60,7 @@ var DEFAULTS = {
     shortcuts: null,
     floatingMode: false, modalWidth: 660, modalHeight: 520,
     modalPosX: -1, modalPosY: -1,
+    mainFontSize: 14,
     visualizePresetId: "",
     enforcePromptLimit: true, maxPromptTokens: 8192
 };
@@ -67,6 +77,40 @@ var translateFn   = null;
 var busy          = false;
 var msgId         = 0;
 var convo         = [];
+
+/* ================ GENERATION CALL HELPERS ================ */
+
+/**
+ * ST moved generateRaw/generateQuietPrompt from positional arguments to a
+ * single options object. Both signatures are destructured with defaults, so
+ * the object-API versions report `fn.length === 0` while the old positional
+ * ones report a non-zero arity. Detect once instead of calling twice inside a
+ * try/catch (the old fallback re-ran generation on *any* error, including API
+ * errors, which cost a second request per failure).
+ */
+function usesObjectApi(fn) { return typeof fn === "function" && fn.length === 0; }
+
+/**
+ * Raw generation: only the system prompt + our prompt are sent. No character
+ * card, no persona, no post-history instructions (jailbreak), no "{{char}}:"
+ * prefix. This is what an OOC answer must use.
+ */
+function callRaw(prompt, systemPrompt) {
+    if (!genRaw) return null;
+    if (usesObjectApi(genRaw)) return genRaw({ prompt: prompt, systemPrompt: systemPrompt || "" });
+    return genRaw(prompt, null, false, false, systemPrompt || "");
+}
+
+/**
+ * Quiet generation: runs the full ST pipeline (card, persona, world info,
+ * jailbreak, force_name2). Use it only when the answer is *supposed* to be
+ * in character.
+ */
+function callQuiet(prompt) {
+    if (!genQuiet) return null;
+    if (usesObjectApi(genQuiet)) return genQuiet({ quietPrompt: prompt });
+    return genQuiet(prompt);
+}
 
 function L() { console.log.apply(console, ["[DirectAsk]"].concat(Array.from(arguments))); }
 function W() { console.warn.apply(console, ["[DirectAsk]"].concat(Array.from(arguments))); }
@@ -235,7 +279,66 @@ function loadSettings() {
 
 function save() { if (saveFn) saveFn(); }
 
+function normalizeMainFontSize(value) {
+    var size = parseInt(value, 10);
+    if (!isFinite(size)) size = DEFAULTS.mainFontSize;
+    return Math.min(32, Math.max(10, size));
+}
+
+function applyMainFontSize() {
+    var size = normalizeMainFontSize(settings && settings.mainFontSize);
+    if (settings) settings.mainFontSize = size;
+    var modal = document.getElementById("direct-ask-modal");
+    if (modal) modal.style.setProperty("--da-main-font-size", size + "px");
+    $("#da-opt-font-size").val(size);
+    $("#da-font-val").text(size);
+    $(".da-font-dec").attr("title", "Decrease font size (" + size + " px)");
+    $(".da-font-inc").attr("title", "Increase font size (" + size + " px)");
+}
+
+function setMainFontSize(value) {
+    settings.mainFontSize = normalizeMainFontSize(value);
+    applyMainFontSize();
+    save();
+}
+
 /* ================ TARGET (CHARACTER) SELECTOR ================ */
+
+/* Pure (v1.0.5). Who can be interviewed: the characters of THE OPEN CHAT — the
+   solo character, or the members of the open group, in the group's order.
+   A group used to offer `ctx.characters`, which is every card installed, so
+   the list was the whole library whatever chat was open. Nothing is filtered
+   by kind: a narrator card or a location card that sits in the group is in
+   the chat like anyone else (and is often the one worth asking). Muted
+   members are listed too — muted is not absent.
+   null means "the context cannot say" (a group whose record is not loaded);
+   the caller then falls back to the names that have spoken in the chat. */
+function daChatTargets(ctx) {
+    if (!ctx) return null;
+    var chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+    var out = [];
+    var add = function (name) {
+        name = String(name == null ? "" : name).trim();
+        if (name && out.indexOf(name) === -1) out.push(name);
+    };
+    if (ctx.groupId) {
+        var groups = Array.isArray(ctx.groups) ? ctx.groups : [], group = null;
+        for (var g = 0; g < groups.length; g++) {
+            if (groups[g] && String(groups[g].id) === String(ctx.groupId)) { group = groups[g]; break; }
+        }
+        if (!group || !Array.isArray(group.members)) return null;
+        for (var m = 0; m < group.members.length; m++) {
+            for (var i = 0; i < chars.length; i++) {
+                if (chars[i] && chars[i].avatar === group.members[m]) { add(chars[i].name); break; }
+            }
+        }
+        return out;
+    }
+    var chid = ctx.characterId;
+    if (chid !== undefined && chid !== null && chid !== "" && chars[chid]) add(chars[chid].name);
+    else if (ctx.name2 && chid !== undefined && chid !== null && chid !== "") add(ctx.name2);
+    return out;
+}
 
 function updateTargetList() {
     var $sel = $("#da-target-select");
@@ -246,23 +349,14 @@ function updateTargetList() {
     $sel.append('<option value="assistant">🤖 AI Assistant (OOC)</option>');
 
     var chars = [];
-    
+    var known = null;       /* null: the context could not say who is in the chat */
+
     if (getContextFn) {
-        try {
-            var ctx = getContextFn();
-            if (ctx) {
-                if (ctx.groupId && Array.isArray(ctx.characters)) {
-                    for(var i = 0; i < ctx.characters.length; i++) {
-                        if(ctx.characters[i].name) chars.push(ctx.characters[i].name);
-                    }
-                } else if (ctx.name2) {
-                    chars.push(ctx.name2);
-                }
-            }
-        } catch(e) {}
+        try { known = daChatTargets(getContextFn()); } catch(e) { known = null; }
     }
-    
-    if (chars.length === 0 && scriptModule && scriptModule.chat) {
+    if (known) chars = known;
+
+    if (known === null && scriptModule && scriptModule.chat) {
         var userName = getContextFn ? ((getContextFn() || {}).name1 || "User") : "User";
         for(var j = 0; j < scriptModule.chat.length; j++) {
             var n = scriptModule.chat[j].name;
@@ -296,13 +390,19 @@ async function askLLM(question) {
     var useCtx = isCharacter ? true : settings.useContext; 
     
     var sysPrompt = "";
+    var oocReminder = "";
     if (isCharacter) {
         sysPrompt = PROMPT_CHARACTER_INTERVIEW.replace(/\{\{char\}\}/g, target);
     } else {
         sysPrompt = useCtx ? settings.promptWithCtx : settings.promptNoCtx;
+        var oocChar = "";
+        try { oocChar = ((getContextFn && getContextFn()) || {}).name2 || ""; } catch (e) {}
+        oocReminder = PROMPT_OOC_REMINDER.replace(/\{\{char\}\}/g, oocChar || "the character");
     }
     
-    var prompt = sysPrompt + "\n\n";
+    // Body only — the system instruction is passed separately (as a real
+    // system message for the OOC path) and re-prepended for the quiet path.
+    var prompt = "";
 
     if (useCtx && getContextFn) {
         try {
@@ -346,14 +446,14 @@ async function askLLM(question) {
         var historyBudget = Infinity;
 
         if (limitOn && maxTokens > 0) {
-            var reserveText = "User: " + question + "\n" + (isCharacter ? target : "Assistant") + ":";
+            var reserveText = "User: " + question + "\n" + oocReminder + "\n" + (isCharacter ? target : "Assistant") + ":";
             if (settings.conversationMode && convo.length > 0) {
                 var slicePreview = convo.slice(-settings.maxContextMessages);
                 for (var ci = 0; ci < slicePreview.length; ci++) {
                     reserveText += slicePreview[ci].role + ": " + slicePreview[ci].content + "\n\n";
                 }
             }
-            var used = estimateTokens(prompt) + estimateTokens(rpHeader) + estimateTokens(rpFooter) + estimateTokens(reserveText);
+            var used = estimateTokens(sysPrompt) + estimateTokens(prompt) + estimateTokens(rpHeader) + estimateTokens(rpFooter) + estimateTokens(reserveText);
             historyBudget = Math.max(0, maxTokens - used);
             // Allow a much larger window of candidate messages when the
             // budget controls the cut-off — limit only by the budget itself.
@@ -400,14 +500,16 @@ async function askLLM(question) {
         prompt += "--- Current interaction ---\n";
     }
 
-    prompt += "User: " + question + "\n" + (isCharacter ? target : "Assistant") + ":";
+    prompt += "User: " + question + "\n";
+    if (!isCharacter) prompt += oocReminder + "\n";
+    prompt += (isCharacter ? target : "Assistant") + ":";
 
     // Final safety net: log a warning if the prompt is still over the user's
     // budget after history truncation (e.g. huge character card + huge sys
     // prompt + huge conversation history). We don't silently mutilate those
     // segments — but the user gets a clear log entry to act on.
     if (settings && settings.enforcePromptLimit && settings.maxPromptTokens > 0) {
-        var finalTokens = estimateTokens(prompt);
+        var finalTokens = estimateTokens(sysPrompt) + estimateTokens(prompt);
         if (finalTokens > settings.maxPromptTokens) {
             W("Prompt is still over the configured limit after truncation: ~" +
               finalTokens + " > " + settings.maxPromptTokens +
@@ -420,15 +522,25 @@ async function askLLM(question) {
 
     var answer;
 
-    if (useCtx || isCharacter) {
+    if (isCharacter) {
+        // Interview mode: the answer is *supposed* to be in character, so the
+        // full ST pipeline (card, persona, world info) is exactly what we want.
         if (!genQuiet) throw new Error("generateQuietPrompt not available. Check API.");
-        answer = await genQuiet(prompt);
+        answer = await callQuiet(sysPrompt + "\n\n" + prompt);
     } else {
-        var fn = genRaw || genQuiet;
-        if (!fn) throw new Error("No generation function. Connect an API first.");
-        // ST updated generateRaw to object API — use object syntax
-        try { answer = await fn({ prompt: prompt }); }
-        catch(e) { answer = await fn(prompt); } // fallback for older ST
+        // OOC assistant: never go through generateQuietPrompt. It runs the
+        // whole character pipeline — card, persona, post-history instructions
+        // ("stay in character") and force_name2 — all of which sit *after* our
+        // OOC instruction and drag the reply back into the character's voice.
+        // generateRaw sends only systemPrompt + our prompt.
+        if (genRaw) {
+            answer = await callRaw(prompt, sysPrompt);
+        } else if (genQuiet) {
+            W("generateRaw unavailable — falling back to generateQuietPrompt. The answer may come out in character.");
+            answer = await callQuiet(sysPrompt + "\n\n" + prompt);
+        } else {
+            throw new Error("No generation function. Connect an API first.");
+        }
     }
 
     if (settings.conversationMode) {
@@ -450,7 +562,8 @@ async function generateNarration(instruction) {
         "Do NOT break character. Do NOT add any OOC notes or explanations. " +
         "Write as the story's narrator, matching the existing language, writing style, " +
         "and tone. Write 2-3 vivid paragraphs.]";
-    return await genQuiet(prompt);
+    // Narration is meant to be in-story, so the full pipeline is correct here.
+    return await callQuiet(prompt);
 }
 
 async function injectToChat(text) {
@@ -500,6 +613,8 @@ function buildModal() {
     h += '<div class="da-overlay"></div><div class="da-dialog">';
     h += '<div class="da-header"><div class="da-title"><i class="fa-solid fa-robot"></i> <span>Direct Ask</span></div>';
     h += '<div class="da-header-actions">';
+    h += '<button class="da-font-btn da-font-dec menu_button" title="Decrease font size" aria-label="Decrease font size">A&minus;</button>';
+    h += '<button class="da-font-btn da-font-inc menu_button" title="Increase font size" aria-label="Increase font size">A+</button>';
     h += '<button class="da-clear-btn menu_button" title="Clear"><i class="fa-solid fa-trash-can"></i></button>';
     h += '<button class="da-close-btn menu_button" title="Close"><i class="fa-solid fa-xmark"></i></button>';
     h += '</div></div>';
@@ -529,12 +644,15 @@ function buildModal() {
     h += '</div></div></div>';
 
     document.body.insertAdjacentHTML("beforeend", h);
+    applyMainFontSize();
     $("#da-use-ctx").prop("checked", settings.useContext);
     updateCtxHint(); renderShortcuts();
 
     $(document).on("click", ".da-overlay", function () { if (!settings.floatingMode) hideModal(); });
     $(document).on("click", ".da-close-btn", function () { hideModal(); });
     $(document).on("click", ".da-clear-btn", clearChat);
+    $(document).on("click", ".da-font-dec", function () { setMainFontSize(settings.mainFontSize - 1); });
+    $(document).on("click", ".da-font-inc", function () { setMainFontSize(settings.mainFontSize + 1); });
     $(document).on("click", "#da-send", doSend);
     
     $(document).on("change", "#da-target-select", function() {
@@ -1050,6 +1168,7 @@ function daGetAIPresetsAll() { var ai = daGetAISettings(); if (!ai || !ai.workfl
 function daGetAIPresetById(id) { if (!id) return null; var p = daGetAIPresetsAll(); for (var i = 0; i < p.length; i++) { if (p[i].id === id) return p[i]; } return null; }
 function daGetAIActivePreset() { var ai = daGetAISettings(); if (!ai || !ai.workflowPresets || !ai.activePresetId) return null; for (var i = 0; i < ai.workflowPresets.length; i++) { if (ai.workflowPresets[i].id === ai.activePresetId) return ai.workflowPresets[i]; } return null; }
 function daGetImagePreset() { if (settings && settings.visualizePresetId) { var p = daGetAIPresetById(settings.visualizePresetId); if (p) return p; } return daGetAIActivePreset(); }
+function daGetAutoIllustratorApi() { return (typeof window !== "undefined" && window.AutoIllustrator) ? window.AutoIllustrator : null; }
 function daGetComfyUrl() { var ai = daGetAISettings(); if (ai && ai.comfyUrl && ai.comfyUrl.trim()) return ai.comfyUrl.trim().replace(/\/+$/, ""); if (extSettings && extSettings.sd && extSettings.sd.comfy_url) return extSettings.sd.comfy_url.replace(/\/+$/, ""); return "http://127.0.0.1:8188"; }
 function daEscJ(s) { return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t"); }
 
@@ -1061,6 +1180,7 @@ function daGetFormatHint(preset) {
         sd15: "Comma-separated tags: detailed, cinematic, dramatic lighting, high quality",
         illustrious: "Danbooru-style tags: detailed, cinematic_composition, atmospheric",
         noobai: "Tags: detailed, cinematic, atmospheric, masterpiece",
+        gemini: "Rich natural-language description in 2-4 flowing sentences. No tag lists or quality keywords. Describe the subject, action, setting, lighting, mood, framing, and visual style.",
         custom: "Descriptive scene illustration prompt."
     };
     return hints[key] || hints.flux;
@@ -1148,16 +1268,65 @@ async function daComfyGenerate(workflowObj) {
     throw new Error("ComfyUI timeout (3 min)");
 }
 
+function daImageSrc(image) {
+    var value = String(image || "");
+    if (!value) return "";
+    if (value.indexOf("data:") === 0 || /^https?:\/\//i.test(value) || value.charAt(0) === "/") return value;
+    return "data:image/jpeg;base64," + value.replace(/\s/g, "");
+}
+
+async function daGenerateWithPreset(preset, imgPrompt, onStatus) {
+    var api = daGetAutoIllustratorApi();
+    if (api && typeof api.illustrateText === "function") {
+        var parts = await api.illustrateText({
+            text: imgPrompt,
+            count: 1,
+            presetId: preset.id,
+            skipAnalysis: true,
+            mirrorToGallery: false,
+            /* v1.0.6: no faces, the same as the ComfyUI branch below (its
+               %char_avatar% is BLANK). Without an avatarMap AutoIllustrator
+               collects the open chat's avatars and, naming nobody, attaches the
+               first one — the companion's face (or the location card's
+               building) as "the character's appearance" in every picture. */
+            avatarMap: {},
+            charNames: [],
+            onStatus: onStatus
+        });
+        var part = parts && parts[0];
+        if (!part || !part.image) throw new Error("AutoIllustrator returned no image.");
+        return { src: daImageSrc(part.image), prompt: part.imagePrompt || imgPrompt };
+    }
+
+    // Compatibility path for older AutoIllustrator versions that did not
+    // expose illustrateText yet. Gemini requires the public API because its
+    // bridge, polling mode, and optional references belong to AutoIllustrator.
+    if (preset.useGemini) throw new Error("AutoIllustrator " + daBridgeEngineLabel(preset) + " API is not ready. Reload SillyTavern and try again.");
+    if (!preset.workflow) throw new Error("Selected preset has no image backend.");
+    if (onStatus) onStatus("Generating image via ComfyUI…");
+    var neg = preset.negativePrompt || "";
+    var wfObj = daFillWorkflow(preset.workflow, imgPrompt, neg, preset.width || 768, preset.height || 768, preset);
+    if (!wfObj) throw new Error("Failed to parse workflow JSON.");
+    var blob = await daComfyGenerate(wfObj);
+    if (!blob) throw new Error("No image returned by ComfyUI.");
+    var dataUrl = await new Promise(function(resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function() { resolve(reader.result); };
+        reader.onerror = function() { reject(new Error("Failed to read image blob")); };
+        reader.readAsDataURL(blob);
+    });
+    return { src: dataUrl, prompt: imgPrompt };
+}
+
 async function daGenerateVisualPrompt(text) {
-    var fn = genRaw || genQuiet;
-    if (!fn) throw new Error("Generation not available. Connect an API first.");
+    if (!genRaw && !genQuiet) throw new Error("Generation not available. Connect an API first.");
     var preset = daGetImagePreset();
     var hint = daGetFormatHint(preset);
     var prompt = PROMPT_VISUALIZE_SCENE
         .replace("{{FORMAT_HINT}}", hint)
         .replace("{{TEXT}}", text.substring(0, 1500));
-    var raw;
-    try { raw = await fn({ prompt: prompt }); } catch(e) { raw = await fn(prompt); }
+    // Pure text->JSON transform: raw generation, no character pipeline.
+    var raw = genRaw ? await callRaw(prompt, "") : await callQuiet(prompt);
     try {
         var m = raw.match(/\{[\s\S]*\}/);
         if (m) { var d = JSON.parse(m[0]); if (d && d.image_prompt) return d.image_prompt.trim(); }
@@ -1171,8 +1340,8 @@ async function visualizeResponse(id, rawText) {
         if (typeof toastr !== "undefined") toastr.error("No AutoIllustrator preset found. Select one in Direct Ask settings.");
         return;
     }
-    if (!preset.workflow) {
-        if (typeof toastr !== "undefined") toastr.error("Selected preset has no ComfyUI workflow.");
+    if (!preset.workflow && !preset.useGemini) {
+        if (typeof toastr !== "undefined") toastr.error("Selected preset has no usable image backend.");
         return;
     }
     var $msg = $("#" + id);
@@ -1183,26 +1352,18 @@ async function visualizeResponse(id, rawText) {
     scrollDown();
     try {
         var imgPrompt = await daGenerateVisualPrompt(rawText);
-        $area.html('<div class="da-viz-loading"><i class="fa-solid fa-circle-notch fa-spin"></i> Generating image via ComfyUI…</div>');
-        scrollDown();
-        var neg = preset.negativePrompt || "";
-        var wfObj = daFillWorkflow(preset.workflow, imgPrompt, neg, preset.width || 768, preset.height || 768, preset);
-        if (!wfObj) throw new Error("Failed to parse workflow JSON.");
-        var blob = await daComfyGenerate(wfObj);
-        if (!blob) throw new Error("No image returned by ComfyUI.");
-        var dataUrl = await new Promise(function(resolve, reject) {
-            var reader = new FileReader();
-            reader.onload = function() { resolve(reader.result); };
-            reader.onerror = function() { reject(new Error("Failed to read image blob")); };
-            reader.readAsDataURL(blob);
+        var result = await daGenerateWithPreset(preset, imgPrompt, function(status) {
+            $area.html('<div class="da-viz-loading"><i class="fa-solid fa-circle-notch fa-spin"></i> ' + esc(status || "Generating image…") + '</div>');
+            scrollDown();
         });
+        imgPrompt = result.prompt || imgPrompt;
         $area.html(
             '<div class="da-viz-result">' +
             '<div class="da-viz-prompt-label" title="' + esc(imgPrompt) + '">' +
             '<i class="fa-solid fa-wand-magic-sparkles"></i> ' +
             '<em>' + esc(imgPrompt.substring(0, 90)) + (imgPrompt.length > 90 ? "…" : "") + '</em>' +
             '</div>' +
-            '<img src="' + dataUrl + '" class="da-viz-img" alt="Visualized scene">' +
+            '<img src="' + result.src + '" class="da-viz-img" alt="Visualized scene">' +
             '</div>'
         );
         $btn.addClass("da-visualized").prop("disabled", false)
@@ -1215,15 +1376,22 @@ async function visualizeResponse(id, rawText) {
     scrollDown();
 }
 
+// Which site a bridge preset draws with (AutoIllustrator 3.21+: bridgeEngine).
+// The preset list and the error text both ask here.
+function daBridgeEngineLabel(preset) {
+    return (preset && preset.bridgeEngine === "chatgpt") ? "ChatGPT" : "Gemini";
+}
+
 function rebuildDAImgPresetDropdown() {
     var $sel = $("#da-opt-viz-preset");
     if (!$sel.length) return;
     var current = $sel.val();
-    $sel.empty().append('<option value="">— Use active AI preset —</option>');
+    $sel.empty().append('<option value="">— Use active AutoIllustrator preset —</option>');
     var presets = daGetAIPresetsAll();
     for (var i = 0; i < presets.length; i++) {
         var p = presets[i];
-        $sel.append('<option value="' + esc(p.id) + '">' + esc(p.name || p.id) + '</option>');
+        var backend = p.useGemini ? ' [' + daBridgeEngineLabel(p) + ']' : '';
+        $sel.append('<option value="' + esc(p.id) + '">' + esc((p.name || p.id) + backend) + '</option>');
     }
     var saved = (settings && settings.visualizePresetId) || current || "";
     if (saved) {
@@ -1268,6 +1436,8 @@ function buildSettingsPanel() {
     h += '</small></label>';
     h += '<input id="da-opt-reset-pos" class="menu_button" type="button" value="Reset position">';
     h += '</div>';
+    h += '<div class="da-srow da-font-size-row"><label><small>Main window font size: <span id="da-font-val">14</span> px</small></label>';
+    h += '<input type="range" id="da-opt-font-size" min="10" max="32" step="1"></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="da-opt-ctx"><span>Use RP context by default</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="da-opt-conv"><span>Conversation mode</span></label></div>';
     h += '<div class="da-srow" id="da-ctxn-row"><label><small>Max context messages: <span id="da-ctx-val">10</span></small></label>';
@@ -1285,12 +1455,12 @@ function buildSettingsPanel() {
     h += '<div class="da-srow da-srow-btns"><input id="da-opt-reset-prompts" class="menu_button" type="button" value="Reset prompts"></div><hr>';
     h += '<div class="da-srow"><label><small><b>\uD83C\uDFA8 Visualize (AutoIllustrator):</b></small></label></div>';
     h += '<div class="da-srow" id="da-viz-preset-row">';
-    h += '<label><small>ComfyUI preset:</small></label>';
+    h += '<label><small>Image preset:</small></label>';
     h += '<div style="display:flex;gap:6px;align-items:center;margin-top:4px">';
-    h += '<select id="da-opt-viz-preset" class="text_pole" style="flex:1;font-size:.85em"><option value="">— Use active AI preset —</option></select>';
+    h += '<select id="da-opt-viz-preset" class="text_pole" style="flex:1;font-size:.85em"><option value="">— Use active AutoIllustrator preset —</option></select>';
     h += '<input id="da-viz-preset-refresh" class="menu_button" type="button" value="\u21BB" title="Refresh preset list">';
     h += '</div></div>';
-    h += '<small class="da-settings-hint">Click <i class="fa-solid fa-image"></i> on any AI reply to visualize it. Requires <b>AutoIllustrator</b> extension with ComfyUI connected.</small><hr>';
+    h += '<small class="da-settings-hint">Click <i class="fa-solid fa-image"></i> on any AI reply to visualize it. Supports AutoIllustrator presets backed by <b>Gemini</b> or <b>ComfyUI</b>.</small><hr>';
     h += '<div class="da-srow"><label><small><b>Quick Shortcuts:</b></small></label></div>';
     h += '<div id="da-sc-list" class="da-sc-list"></div>';
     h += '<div class="da-sc-add-form">';
@@ -1318,6 +1488,11 @@ function buildSettingsPanel() {
     $("#da-opt-w").val(settings.modalWidth || 660).on("change", function () { settings.modalWidth = Math.max(320, parseInt(this.value, 10) || 660); save(); if (settings.floatingMode && $("#direct-ask-modal").is(":visible")) applyModalMode(); });
     $("#da-opt-h").val(settings.modalHeight || 520).on("change", function () { settings.modalHeight = Math.max(280, parseInt(this.value, 10) || 520); save(); if (settings.floatingMode && $("#direct-ask-modal").is(":visible")) applyModalMode(); });
     $("#da-opt-reset-pos").on("click", function () { settings.modalPosX = -1; settings.modalPosY = -1; save(); if (settings.floatingMode && $("#direct-ask-modal").is(":visible")) applyModalMode(); if (typeof toastr !== "undefined") toastr.info("Position reset."); });
+    settings.mainFontSize = normalizeMainFontSize(settings.mainFontSize);
+    $("#da-opt-font-size").val(settings.mainFontSize).on("input", function () {
+        setMainFontSize(this.value);
+    });
+    applyMainFontSize();
     $("#da-opt-ctx").prop("checked", settings.useContext).on("change", function () { settings.useContext = this.checked; save(); $("#da-use-ctx").prop("checked", this.checked); updateCtxHint(); });
     $("#da-opt-conv").prop("checked", settings.conversationMode).on("change", function () { settings.conversationMode = this.checked; save(); $("#da-ctxn-row").toggle(this.checked); });
     $("#da-ctxn-row").toggle(settings.conversationMode);
@@ -1358,6 +1533,7 @@ function buildSettingsPanel() {
     // Visualize preset
     rebuildDAImgPresetDropdown();
     setTimeout(rebuildDAImgPresetDropdown, 2000);
+    try { document.addEventListener("autoillustrator:ready", rebuildDAImgPresetDropdown); } catch (e) {}
     $(document).on("change", "#da-opt-viz-preset", function () { settings.visualizePresetId = this.value; save(); });
     $(document).on("click", "#da-viz-preset-refresh", function () {
         rebuildDAImgPresetDropdown();

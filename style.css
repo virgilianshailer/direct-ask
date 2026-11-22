@@ -90,6 +90,7 @@ body.da-dragging * { cursor: grabbing !important; }
 
 /* ── Modal overlay ── */
 #direct-ask-modal {
+    --da-main-font-size: 14px;
     position: fixed;
     inset: 0;
     z-index: 99999;
@@ -156,6 +157,10 @@ body.da-dragging * { cursor: grabbing !important; }
     font-size: 14px;
     border-radius: 6px;
 }
+.da-header-actions .da-font-btn {
+    min-width: 34px;
+    font-weight: 600;
+}
 
 /* ── Body / conversation ── */
 .da-body {
@@ -194,8 +199,8 @@ body.da-dragging * { cursor: grabbing !important; }
     user-select: none;
 }
 .da-welcome i  { font-size: 44px; margin-bottom: 12px; }
-.da-welcome p  { margin: 0; font-size: 14px; }
-.da-hint       { font-size: 12px !important; opacity: .7; }
+.da-welcome p  { margin: 0; font-size: var(--da-main-font-size); }
+.da-hint       { font-size: max(8px, calc(var(--da-main-font-size) - 2px)) !important; opacity: .7; }
 
 /* ── Messages ── */
 .da-message {
@@ -257,7 +262,7 @@ body.da-dragging * { cursor: grabbing !important; }
 .da-copy-btn:hover { opacity: 1; }
 
 .da-msg-content {
-    font-size: 14px;
+    font-size: var(--da-main-font-size);
     line-height: 1.65;
     color: var(--SmartThemeBodyColor, #ddd);
     word-wrap: break-word;
@@ -268,7 +273,7 @@ body.da-dragging * { cursor: grabbing !important; }
     padding: 2px 6px;
     border-radius: 4px;
     font-family: 'Consolas','Monaco','Fira Code',monospace;
-    font-size: 13px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 1px));
 }
 .da-msg-content pre {
     background: rgba(0,0,0,.25);
@@ -301,7 +306,7 @@ body.da-dragging * { cursor: grabbing !important; }
     border: 1px solid var(--SmartThemeBorderColor, #444);
     border-radius: 12px;
     padding: 10px 14px;
-    font-size: 14px;
+    font-size: var(--da-main-font-size);
     line-height: 1.45;
     background: rgba(0,0,0,.18);
     color: var(--SmartThemeBodyColor, #e0e0e0);
@@ -470,7 +475,7 @@ body.da-dragging * { cursor: grabbing !important; }
     border: 1px solid var(--SmartThemeBorderColor, #444);
     background: rgba(0,0,0,.12);
     color: var(--SmartThemeBodyColor, #ccc);
-    font-size: 12px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 2px));
     cursor: pointer;
     white-space: nowrap;
     transition: all .2s;
@@ -491,10 +496,10 @@ body.da-dragging * { cursor: grabbing !important; }
 /* ── Shortcut message styling ── */
 .da-sc-sent {
     font-weight: 600;
-    font-size: 13px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 1px));
 }
 .da-sc-prompt-preview {
-    font-size: 11px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 3px));
     opacity: .5;
     font-style: italic;
 }
@@ -602,14 +607,14 @@ body.da-dragging * { cursor: grabbing !important; }
 }
 
 .da-translated-text {
-    font-size: 14px;
+    font-size: var(--da-main-font-size);
     line-height: 1.6;
     color: var(--SmartThemeQuoteColor, #5bc0de);
     opacity: .9;
 }
 
 .da-translation-loading {
-    font-size: 12px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 2px));
     opacity: .6;
     font-style: italic;
 }
@@ -735,7 +740,7 @@ body.da-dragging * { cursor: grabbing !important; }
     background: rgba(0,0,0,.2);
     padding: 4px 8px;
     border-radius: 4px;
-    font-size: 11px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 3px));
     margin-top: 4px;
     color: var(--SmartThemeQuoteColor, #5bc0de);
 }
@@ -766,7 +771,7 @@ body.da-dragging * { cursor: grabbing !important; }
 }
 
 .da-viz-loading {
-    font-size: 12px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 2px));
     opacity: .65;
     font-style: italic;
     color: #a29bfe;
@@ -781,7 +786,7 @@ body.da-dragging * { cursor: grabbing !important; }
 }
 
 .da-viz-prompt-label {
-    font-size: 11px;
+    font-size: max(8px, calc(var(--da-main-font-size) - 3px));
     opacity: .5;
     color: var(--SmartThemeBodyColor, #aaa);
     line-height: 1.4;

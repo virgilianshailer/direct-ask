@@ -15,6 +15,7 @@ A SillyTavern extension that lets you ask the AI questions **out-of-character**,
 - **Translation** — translate any AI response inline using SillyTavern's built-in **translate** extension.
 - **Conversation mode** — keep a short-term history within Direct Ask so follow-up questions retain context.
 - **Floating / draggable window** — optionally detach the dialog from modal mode into a free-floating, resizable window that stays open while you RP.
+- **Prompt size limit** — cap the total prompt at a configurable token budget. Older RP-chat messages are dropped first so you don't hit the API's *"context length exceeded"* errors on models with a small window.
 - **Slash commands** — `/ask <question>`, `/direct`, `/inject-event <instruction>`.
 - **Keyboard shortcut** — `Ctrl+Shift+A` toggles the panel.
 - **Fully theme-aware** — built on SillyTavern's CSS variables; looks native in any theme.
@@ -76,13 +77,13 @@ There are three ways:
 
 ### Visualizing a scene (image generation)
 
-Direct Ask integrates with the **AutoIllustrator** extension to turn AI responses into images via ComfyUI.
+Direct Ask integrates with the **AutoIllustrator** extension to turn AI responses into images through either Gemini or ComfyUI presets.
 
-1. Make sure the **AutoIllustrator** extension is installed and connected to a running ComfyUI instance.
-2. In **Extensions → Direct Ask → Visualize**, pick a ComfyUI preset (or leave it as **— Use active AI preset —**).
-3. In any Direct Ask reply, click the 🖼 image icon. Direct Ask will build an image generation prompt from the reply and send it to ComfyUI. The result is shown inline.
+1. Make sure the **AutoIllustrator** extension is installed and its selected backend is available (Gemini bridge or ComfyUI).
+2. In **Extensions → Direct Ask → Visualize**, pick an image preset (or leave it as **— Use active AutoIllustrator preset —**).
+3. In any Direct Ask reply, click the 🖼 image icon. Direct Ask builds an image prompt and sends it through AutoIllustrator using the selected preset. The result is shown inline.
 
-> If the selected preset has no ComfyUI workflow, the visualize button will report an error — pick a preset that does.
+> Gemini presets do not need a ComfyUI workflow; their bridge port and model mode are taken from the AutoIllustrator preset.
 
 ### Attaching files
 
@@ -108,13 +109,16 @@ All settings live under **Extensions → Direct Ask**:
 | Floating mode | Detach the dialog into a draggable floating window |
 | Window size (W × H) | Floating window dimensions in pixels |
 | Reset position | Move the floating window back to the screen center |
+| Main window font size | Adjust the Direct Ask conversation, shortcuts, and input text from 10 to 32 px; the A−/A+ header buttons provide quick access |
 | Use RP context by default | Whether context is on by default in OOC assistant mode |
 | Conversation mode | Keep a short history of this session for follow-ups |
 | Max context messages | How many recent messages to include in follow-up context |
+| Limit prompt size | Cap the prompt at a token budget; prevents "context length exceeded" errors |
+| Max prompt tokens | The budget itself (512 – 1,000,000). Set this a bit below your model's context window to leave room for the reply. Older RP messages are dropped first to fit. |
 | Prompt WITH RP context | System prompt used when RP context is enabled |
 | Prompt WITHOUT context | System prompt used for general-knowledge questions |
 | Reset prompts | Restore both system prompts to defaults |
-| 🎨 Visualize (AutoIllustrator) — ComfyUI preset | Preset used when visualizing replies; refresh button reloads the list |
+| 🎨 Visualize (AutoIllustrator) — Image preset | Gemini or ComfyUI preset used when visualizing replies; refresh button reloads the list |
 | Quick Shortcuts | Add, edit, remove, or reset shortcut buttons |
 
 ---
